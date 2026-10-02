@@ -21,6 +21,60 @@ INDICES = {  # name: (breadth sheet, yahoo ticker)
 PRICE_FILE = os.environ.get("PRICE_CSV")  # optional offline override: Date,Nifty 50,Nifty 500
 
 
+STATE_FILE = os.environ.get("STATE_FILE", "docs/state.json")
+DASH_URL = os.environ.get("DASH_URL", "")
+ICON = {"Extreme oversold": "🔴", "Oversold": "🟠", "Neutral": "⚪", "Overbought": "🟢"}
+
+
+def send_telegram(text):
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if os.environ.get("TELEGRAM_DRY_RUN"):
+        print("--- telegram (dry run) ---\n" + text)
+        return True
+    if not (token and chat):
+        print("Telegram secrets not set, skipping alert", file=sys.stderr)
+        return False
+    import urllib.request, urllib.parse
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=body), timeout=30).read()
+        return True
+    except Exception as e:
+        print(f"telegram send failed: {e}", file=sys.stderr)
+        return False
+
+
+def alerts(data):
+    """Send a Telegram message every run: a daily summary, flagged when an index status changed."""
+    try:
+        old = json.load(open(STATE_FILE))
+    except Exception:
+        old = None
+    new, lines, changed = {}, [], False
+    for name, d in data["idx"].items():
+        new[name] = d["status"]
+        prev = (old or {}).get(name)
+        if prev != d["status"]:
+            changed = True
+        c, r = d["cur"], d["ret"]
+        arrow = f"{prev} -> {d['status']}" if prev and prev != d["status"] else d["status"]
+        px = f"{d['last']:,.2f} ({r.get('1D', 0):+.2f}% 1D, {r.get('1M', 0):+.2f}% 1M)" if d["last"] else "price n/a"
+        lines.append(f"{ICON[d['status']]} {name}: {arrow}\n   Close {px}\n"
+                     f"   % above EMA  20: {c['e20']}  50: {c['e50']}  200: {c['e200']}\n"
+                     f"   50 EMA breadth percentile {d['pct']['e50']} (oversold at {d['zones']['oversold']} or lower)")
+    daily = os.environ.get("TELEGRAM_DAILY", "1") != "0"
+    if changed or daily:
+        day = data["idx"][next(iter(data["idx"]))]["breadth_date"]
+        head = (f"NSE breadth ALERT: status changed, {day}" if changed and old is not None
+                else f"NSE breadth daily summary, {day}")
+        msg = head + "\n\n" + "\n\n".join(lines) + (f"\n\n{DASH_URL}" if DASH_URL else "")
+        if not send_telegram(msg):
+            return                      # keep old state so a status-change alert is retried next run
+    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+    json.dump(new, open(STATE_FILE, "w"))
+
+
 _cache = {}
 
 
@@ -126,8 +180,9 @@ def build():
         status = ("Extreme oversold" if cur.e50 <= z["extreme"] else "Oversold" if cur.e50 <= z["oversold"]
                   else "Overbought" if cur.e50 >= z["overbought"] else "Neutral")
         pxs = px.iloc[-520:]
-        d50 = px.rolling(50).mean().iloc[-520:]
-        d200 = px.rolling(200).mean().iloc[-520:]
+        d20 = px.ewm(span=20, adjust=False).mean().iloc[-520:]
+        d50 = px.ewm(span=50, adjust=False).mean().iloc[-520:]
+        d200 = px.ewm(span=200, adjust=False).mean().iloc[-520:]
         data["idx"][name] = {
             "status": status, "zones": z, "pct": pct,
             "breadth_date": b.index[-1].strftime("%Y-%m-%d"),
@@ -135,6 +190,7 @@ def build():
             "b": {"d": [d.strftime("%Y-%m-%d") for d in b.index],
                   **{k: b[k].round(1).tolist() for k in ("e20", "e50", "e200")}},
             "p": {"d": [d.strftime("%Y-%m-%d") for d in pxs.index], "c": pxs.round(2).tolist(),
+                  "m20": [None if np.isnan(v) else round(float(v), 2) for v in d20],
                   "m50": [None if np.isnan(v) else round(float(v), 2) for v in d50],
                   "m200": [None if np.isnan(v) else round(float(v), 2) for v in d200]},
             "last": round(float(px.iloc[-1]), 2) if len(px) else None,
@@ -145,6 +201,7 @@ def build():
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(TEMPLATE.replace("__DATA__", json.dumps(data, separators=(",", ":"))))
     print("wrote", OUT, {k: v["status"] for k, v in data["idx"].items()})
+    alerts(data)
 
 
 TEMPLATE = r'''<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -188,7 +245,7 @@ th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid)}th:fi
 <p class="sub" id="upd"></p>
 <div class="cards" id="cards"></div>
 <div class="bar" id="tabs"></div>
-<div class="card"><h2 id="t1"></h2><svg id="s1" viewBox="0 0 900 300" role="img" aria-label="Index price with 50 and 200 day averages"></svg><div class="read" id="r1"></div></div>
+<div class="card"><h2 id="t1"></h2><div class="bar" id="pser"></div><svg id="s1" viewBox="0 0 900 300" role="img" aria-label="Index price with 20, 50 and 200 EMA"></svg><div class="read" id="r1"></div></div>
 <div class="card" style="margin-top:12px"><h2>Breadth: share of stocks above EMA</h2><div class="bar" id="ser"></div><svg id="s2" viewBox="0 0 900 300" role="img" aria-label="Breadth lines with oversold bands"></svg><div class="read" id="r2"></div></div>
 <div class="card" style="margin-top:12px"><h2 id="t3"></h2><div class="scroll"><table id="fwd"></table></div></div>
 <p class="note">Status uses this index's own history: oversold is the bottom 10% of % above 50 EMA readings, extreme is the bottom 3%, overbought is the top 10%. Red shading on the price chart marks days breadth was oversold. Breadth history is short, so zones describe this sample only. Not investment advice.</p>
@@ -197,7 +254,8 @@ th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid)}th:fi
 const DATA=__DATA__;
 const NS='http://www.w3.org/2000/svg',css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const S=[['e20','% above 20 EMA','--c20'],['e50','% above 50 EMA','--c50'],['e200','% above 200 EMA','--c200']];
-let cur=Object.keys(DATA.idx)[0],on={e20:true,e50:true,e200:true};
+let cur=Object.keys(DATA.idx)[0],on={e20:true,e50:true,e200:true},pon={c:true,m20:true,m50:true,m200:true};
+const P=[['c','Close','--px',1.8],['m20','20 EMA','--c20',1.2],['m50','50 EMA','--c50',1.2],['m200','200 EMA','--c200',1.2]];
 const f=(v,d=2)=>v==null?'n/a':v.toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d});
 const cls=v=>v==null?'':v>=0?'up':'dn';
 const sc=s=>s.startsWith('Extreme')?'--red':s==='Oversold'?'--amb':s==='Overbought'?'--grn':'--mut';
@@ -234,15 +292,17 @@ function render(){
  Object.keys(DATA.idx).forEach(k=>{const b=document.createElement('button');b.textContent=k;b.setAttribute('aria-pressed',k===cur);b.onclick=()=>{cur=k;render()};tabs.appendChild(b)});
  const ser=document.getElementById('ser');ser.innerHTML='';
  S.forEach(([k,l,c])=>{const b=document.createElement('button');b.setAttribute('aria-pressed',on[k]);b.innerHTML='<span class="sw" style="background:var('+c+')"></span>'+l;b.onclick=()=>{on[k]=!on[k];render()};ser.appendChild(b)});
+ const ps=document.getElementById('pser');ps.innerHTML='';
+ P.forEach(([k,l,c])=>{const b=document.createElement('button');b.setAttribute('aria-pressed',pon[k]);b.innerHTML='<span class="sw" style="background:var('+c+')"></span>'+l;b.onclick=()=>{pon[k]=!pon[k];render()};ps.appendChild(b)});
  const d=DATA.idx[cur],bt=T(d.b.d),pt=T(d.p.d);
- document.getElementById('t1').textContent=cur+' price with 50 and 200 day averages';
+ document.getElementById('t1').textContent=cur+' price with 20, 50 and 200 EMA';
  document.getElementById('t3').textContent='After breadth got this oversold ('+d.zones.oversold+'% above 50 EMA or lower): change in % above 50 EMA';
  const t0=pt.length?pt[0]:bt[0],t1=Math.max(bt[bt.length-1],pt.length?pt[pt.length-1]:0);
  // shade price chart where breadth oversold
  const sh=[];let st=null;d.b.e50.forEach((v,i)=>{if(v<=d.zones.oversold){if(st==null)st=bt[i]}else if(st!=null){sh.push([st,bt[i-1]+864e5]);st=null}});if(st!=null)sh.push([st,bt[bt.length-1]+864e5]);
  const r1=document.getElementById('r1'),s1=document.getElementById('s1');
- if(pt.length){const all=d.p.c.concat(d.p.m50.filter(v=>v!=null),d.p.m200.filter(v=>v!=null)),mn=Math.min(...all),mx=Math.max(...all),pad=(mx-mn)*.05;
-  chart(s1,r1,{t0,t1,min:mn-pad,max:mx+pad,fmt:v=>f(v,0),shade:sh,series:[{n:'Close',t:pt,v:d.p.c,c:'--px',w:1.8},{n:'50 DMA',t:pt,v:d.p.m50,c:'--c50',w:1.2},{n:'200 DMA',t:pt,v:d.p.m200,c:'--c200',w:1.2}]})}
+ if(pt.length){const act=P.filter(p=>pon[p[0]]);const all=[].concat(...(act.length?act:P.slice(0,1)).map(p=>d.p[p[0]].filter(v=>v!=null))),mn=Math.min(...all),mx=Math.max(...all),pad=(mx-mn)*.05;
+  chart(s1,r1,{t0,t1,min:mn-pad,max:mx+pad,fmt:v=>f(v,0),shade:sh,series:act.length?act.map(p=>({n:p[1],t:pt,v:d.p[p[0]],c:p[2],w:p[3]})):[{n:'Close',t:pt,v:d.p.c,c:'--px',w:0}]})}
  else{s1.innerHTML='';r1.textContent='Price data unavailable for this run.'}
  const r2=document.getElementById('r2');
  chart(document.getElementById('s2'),r2,{t0:bt[0],t1:bt[bt.length-1],min:0,max:100,fmt:v=>Math.round(v)+'%',
